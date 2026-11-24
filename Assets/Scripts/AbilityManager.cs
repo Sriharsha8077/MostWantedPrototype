@@ -2,6 +2,15 @@ using System;
 using System.Collections.Generic;
 using UnityEngine;
 
+public enum AbilityEffect
+{
+    Auto,    // old behaviour: removes police if "Max Police Removed" > 0, otherwise stuns
+    Remove,  // bombs: remove police at the chasing group
+    Stun,    // police freeze completely (goes off on the player)
+    Slow,    // police move slower (goes off on the player)
+    Blind    // police lose track of you and walk to where you were (goes off on the player)
+}
+
 [Serializable]
 public class AbilityDefinition
 {
@@ -10,9 +19,22 @@ public class AbilityDefinition
     public float cooldown;
     public float effectRadius;
     public int maxPoliceRemoved;
+    [Tooltip("How long a Stun / Slow / Blind lasts, in seconds.")]
     public float disableDuration;
     public bool isNuke;
     public int requiredWantedLevel;
+
+    [Header("Effect type")]
+    public AbilityEffect effect = AbilityEffect.Auto;
+    [Tooltip("Slow only. 0.4 means police move at 40% speed.")]
+    [Range(0.05f, 1f)] public float slowMultiplier = 0.4f;
+    [Tooltip("Untick on crowd-control abilities if you don't want the explosion effect on the player.")]
+    public bool showExplosionEffect = true;
+
+    [Header("Audio")]                                  // AUDIO
+    public AudioClip activationSound;                  // AUDIO
+    [Range(0f, 1f)] public float soundVolume = 1f;     // AUDIO
+
     [HideInInspector] public float cooldownTimer;
 }
 
@@ -21,6 +43,10 @@ public class AbilityManager : MonoBehaviour
     public static AbilityManager Instance;
     public List<AbilityDefinition> abilities = new List<AbilityDefinition>();
     public GameObject explosionEffectPrefab;
+
+    [Tooltip("Optional. A circle-sprite prefab with the AbilityPulse script. Shows the ability's radius.")]
+    public GameObject pulsePrefab;
+
     public float clusterSearchRadius = 20f;
     public int clusterSampleCount = 20;
 
@@ -42,15 +68,35 @@ public class AbilityManager : MonoBehaviour
         ability.cooldownTimer = ability.cooldown;
         GameManager.Instance.ReportAbilityUsed();
 
-        Vector3 targetPosition = FindNearestPoliceClusterCenter(searchOrigin);
+        if (AudioManager.Instance != null)                                // AUDIO
+            AudioManager.Instance.PlayAbility(ability);                   // AUDIO
+
+        AbilityEffect effect = ResolveEffect(ability);
+
+        // Bombs strike where the chasing group is.
+        // Stun / Slow / Blind always go off ON the player, so the officers closest to you are always caught.
+        Vector3 targetPosition = effect == AbilityEffect.Remove
+            ? FindNearestPoliceClusterCenter(searchOrigin)
+            : searchOrigin;
 
         if (ability.isNuke) ActivateNuke();
-        else ApplyAreaEffect(targetPosition, ability);
+        else ApplyAreaEffect(targetPosition, ability, effect);
 
-        if (explosionEffectPrefab != null)
+        if (ability.showExplosionEffect && explosionEffectPrefab != null)
             Instantiate(explosionEffectPrefab, targetPosition, Quaternion.identity);
 
+        if (!ability.isNuke) SpawnPulse(targetPosition, ability.effectRadius, effect);
+
         return true;
+    }
+
+    // Old rows (Effect = Auto) keep working: removes if it has a removal count, otherwise stuns.
+    static AbilityEffect ResolveEffect(AbilityDefinition a)
+    {
+        if (a.effect != AbilityEffect.Auto) return a.effect;
+        if (a.maxPoliceRemoved > 0) return AbilityEffect.Remove;
+        if (a.disableDuration > 0f) return AbilityEffect.Stun;
+        return AbilityEffect.Remove;
     }
 
     Vector3 FindNearestPoliceClusterCenter(Vector3 searchOrigin)
@@ -74,7 +120,7 @@ public class AbilityManager : MonoBehaviour
         return sum / take;
     }
 
-    void ApplyAreaEffect(Vector3 position, AbilityDefinition ability)
+    void ApplyAreaEffect(Vector3 position, AbilityDefinition ability, AbilityEffect effect)
     {
         Collider2D[] hits = Physics2D.OverlapCircleAll(position, ability.effectRadius);
         int removed = 0;
@@ -85,17 +131,46 @@ public class AbilityManager : MonoBehaviour
             PoliceUnit unit = hit.GetComponent<PoliceUnit>();
             if (unit == null) continue;
 
-            if (ability.maxPoliceRemoved > 0)
+            switch (effect)
             {
-                if (removed >= ability.maxPoliceRemoved) continue;
-                PolicePool.Instance.Return(hit.gameObject);
-                removed++;
-                GameManager.Instance.ReportPoliceKilled();
+                case AbilityEffect.Remove:
+                    if (ability.maxPoliceRemoved <= 0 || removed >= ability.maxPoliceRemoved) break;
+                    PolicePool.Instance.Return(hit.gameObject);
+                    removed++;
+                    GameManager.Instance.ReportPoliceKilled();
+                    break;
+
+                case AbilityEffect.Stun:
+                    unit.Disable(ability.disableDuration);
+                    break;
+
+                case AbilityEffect.Slow:
+                    unit.Slow(ability.slowMultiplier, ability.disableDuration);
+                    break;
+
+                case AbilityEffect.Blind:
+                    unit.Blind(position, ability.disableDuration);
+                    break;
             }
-            else if (ability.disableDuration > 0)
-            {
-                unit.Disable(ability.disableDuration);
-            }
+        }
+    }
+
+    void SpawnPulse(Vector3 position, float radius, AbilityEffect effect)
+    {
+        if (pulsePrefab == null) return;
+        GameObject go = Instantiate(pulsePrefab, position, Quaternion.identity);
+        AbilityPulse pulse = go.GetComponent<AbilityPulse>();
+        if (pulse != null) pulse.Init(radius, PulseColor(effect));
+    }
+
+    static Color PulseColor(AbilityEffect effect)
+    {
+        switch (effect)
+        {
+            case AbilityEffect.Stun:  return new Color(1f, 0.92f, 0.2f);
+            case AbilityEffect.Slow:  return new Color(0.4f, 0.9f, 0.5f);
+            case AbilityEffect.Blind: return new Color(0.75f, 0.75f, 0.75f);
+            default:                  return new Color(1f, 0.55f, 0.2f);
         }
     }
 
@@ -106,6 +181,6 @@ public class AbilityManager : MonoBehaviour
             PolicePool.Instance.Return(p.gameObject);
             GameManager.Instance.ReportPoliceKilled();
         }
-        GameManager.Instance.EndRun("Nuclear Detonation");
+        GameManager.Instance.EndRun(GameManager.NukeCause);
     }
 }
